@@ -11,6 +11,7 @@ from whatsapp import (
     get_message_context as whatsapp_get_message_context,
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
+    request_history_sync as whatsapp_request_history_sync,
     send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media
 )
@@ -153,6 +154,21 @@ def get_message_context(
     """
     context = whatsapp_get_message_context(message_id, before, after)
     return context
+
+@mcp.tool()
+def sync_chat_history(chat_jid: str, count: int = 50, include_newest: bool = True) -> Dict[str, Any]:
+    """Ask the phone to (re)send recent history of a chat, including emoji reactions.
+
+    Use when a chat looks incomplete (e.g. a reaction you know exists is missing). The data
+    arrives asynchronously within a few seconds; query the chat again afterwards.
+
+    Args:
+        chat_jid: Chat JID, phone number or LID (any form accepted by get_chat)
+        count: How many most recent messages to request (default 50)
+        include_newest: Also re-fetch the newest stored message itself (default True)
+    """
+    success, status_message = whatsapp_request_history_sync(chat_jid, count, include_newest)
+    return {"success": success, "message": status_message}
 
 @mcp.tool()
 def send_message(

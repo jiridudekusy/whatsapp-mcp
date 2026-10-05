@@ -1,6 +1,6 @@
 import sqlite3
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, List, Tuple, Dict, Any
 import os.path
 import requests
@@ -21,6 +21,9 @@ class Message:
     id: str
     chat_name: Optional[str] = None
     media_type: Optional[str] = None
+    # Emoji reactions to this message: {emoji, sender, sender_name, timestamp}. Reactions
+    # belong to the message; they are not separate entries in listings.
+    reactions: List[Dict[str, Any]] = field(default_factory=list)
 
 @dataclass
 class Chat:
@@ -101,6 +104,50 @@ def _in_clause(column: str, values: List[str], params: list) -> str:
     return f"{column} IN ({','.join('?' * len(values))})"
 
 
+def _attach_reactions(cursor, messages: List["Message"]) -> List["Message"]:
+    """Attach reactions from the `reactions` table to the messages (one query per batch)."""
+    if not messages:
+        return messages
+    ids = sorted({m.id for m in messages if m.id})
+    if not ids:
+        return messages
+    try:
+        cursor.execute(
+            f"SELECT message_id, chat_jid, sender, emoji, timestamp FROM reactions "
+            f"WHERE message_id IN ({','.join('?' * len(ids))}) ORDER BY timestamp",
+            tuple(ids),
+        )
+        rows = cursor.fetchall()
+    except sqlite3.OperationalError:
+        # Older messages.db without a reactions table (the Go bridge creates it on start).
+        return messages
+    by_message: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for message_id, chat_jid, sender, emoji, timestamp in rows:
+        by_message.setdefault((message_id, chat_jid), []).append({
+            "emoji": emoji,
+            "sender": sender,
+            "sender_name": get_sender_name(sender),
+            "timestamp": timestamp,
+        })
+    for m in messages:
+        m.reactions = by_message.get((m.id, m.chat_jid), [])
+    return messages
+
+
+def _format_reactions(reactions: List[Dict[str, Any]]) -> str:
+    if not reactions:
+        return ""
+    parts = []
+    for r in reactions:
+        ts = r.get("timestamp") or ""
+        try:
+            ts = f"{datetime.fromisoformat(ts):%Y-%m-%d %H:%M:%S}"
+        except (TypeError, ValueError):
+            pass
+        parts.append(f"{r['emoji']} by {r.get('sender_name') or r['sender']} at {ts}".rstrip())
+    return " [reactions: " + "; ".join(parts) + "]"
+
+
 def format_message(message: Message, show_chat_info: bool = True) -> None:
     """Print a single message with consistent formatting."""
     output = ""
@@ -121,7 +168,7 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
     
     try:
         sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
-        output += f"From: {sender_name}: {content_prefix}{message.content}\n"
+        output += f"From: {sender_name}: {content_prefix}{message.content}{_format_reactions(message.reactions)}\n"
     except Exception as e:
         print(f"Error formatting message: {e}")
     return output
@@ -213,6 +260,7 @@ def list_messages(
                 media_type=msg[7]
             )
             result.append(message)
+        _attach_reactions(cursor, result)
             
         if include_context and result:
             # Add context for each message
@@ -315,6 +363,7 @@ def get_message_context(
                 media_type=msg[7]
             ))
         
+        _attach_reactions(cursor, [target_message, *before_messages, *after_messages])
         return MessageContext(
             message=target_message,
             before=before_messages,
@@ -517,6 +566,7 @@ def get_last_interaction(jid: str) -> str:
             media_type=msg_data[7]
         )
         
+        _attach_reactions(cursor, [message])
         return format_message(message)
         
     except sqlite3.Error as e:
@@ -627,6 +677,32 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
     finally:
         if 'conn' in locals():
             conn.close()
+
+def request_history_sync(chat_jid: str, count: int = 50, include_newest: bool = True) -> Tuple[bool, str]:
+    """Ask the phone for an on-demand history sync of a chat (older messages and reactions).
+
+    The response arrives asynchronously as a HistorySync event that the Go bridge processes
+    in the background; later queries typically see the result within a few seconds.
+    """
+    cands = jids.candidate_jids(chat_jid)
+    # The phone answers on-demand sync requests only for the phone-number JID; a LID JID
+    # is silently ignored.
+    phone = jids.phone_number(chat_jid)
+    request_jid = f"{phone}@{jids.PN_SERVER}" if phone and not jids.is_group(chat_jid) else (cands[0] if cands else chat_jid)
+    try:
+        response = requests.post(
+            f"{WHATSAPP_API_BASE_URL}/history",
+            json={"chat_jid": request_jid, "candidates": cands,
+                  "count": count, "include_newest": include_newest},
+            timeout=20,
+        )
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        return False, f"Error: HTTP {response.status_code} - {response.text}"
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+
 
 def send_message(recipient: str, message: str) -> Tuple[bool, str]:
     try:

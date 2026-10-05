@@ -86,6 +86,19 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
+
+		-- Emoji reactions belong to a message (message_id, chat_jid); a sender has at most
+		-- one reaction per message, so a change is an overwrite and a removal is a DELETE.
+		-- A reaction is not a message: it changes neither message counts, ordering nor
+		-- chats.last_message_time.
+		CREATE TABLE IF NOT EXISTS reactions (
+			message_id TEXT,
+			chat_jid TEXT,
+			sender TEXT,
+			emoji TEXT,
+			timestamp TIMESTAMP,
+			PRIMARY KEY (message_id, chat_jid, sender)
+		);
 	`)
 	if err != nil {
 		db.Close()
@@ -117,6 +130,14 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		return nil
 	}
 
+	// The same chat can arrive under two JID forms (LID vs. phone number) - live under one,
+	// from history sync under the other. Do not store a message whose id is already stored
+	// under another chat_jid, or list_messages would show two copies.
+	var existingChat string
+	if err := store.db.QueryRow("SELECT chat_jid FROM messages WHERE id = ? LIMIT 1", id).Scan(&existingChat); err == nil && existingChat != chatJID {
+		return nil
+	}
+
 	_, err := store.db.Exec(
 		`INSERT OR REPLACE INTO messages 
 		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
@@ -124,6 +145,73 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 	)
 	return err
+}
+
+// StoreReaction stores sender's reaction to a message; an empty emoji removes it.
+// The chat is taken from the target message when it is in the database (a reaction may
+// arrive under a different JID form - LID vs. phone number - than the message was stored
+// under); otherwise the chatJID of the event is used.
+func (store *MessageStore) StoreReaction(messageID, chatJID, sender, emoji string, timestamp time.Time) error {
+	if messageID == "" {
+		return fmt.Errorf("reaction without target message id")
+	}
+	var stored string
+	rows, err := store.db.Query("SELECT chat_jid FROM messages WHERE id = ? LIMIT 2", messageID)
+	if err == nil {
+		n := 0
+		for rows.Next() {
+			var c string
+			if rows.Scan(&c) == nil {
+				stored = c
+				n++
+			}
+		}
+		rows.Close()
+		if n == 1 {
+			chatJID = stored
+		}
+	}
+	if emoji == "" {
+		_, err = store.db.Exec(
+			"DELETE FROM reactions WHERE message_id = ? AND chat_jid = ? AND sender = ?",
+			messageID, chatJID, sender,
+		)
+		return err
+	}
+	_, err = store.db.Exec(
+		`INSERT OR REPLACE INTO reactions (message_id, chat_jid, sender, emoji, timestamp)
+		VALUES (?, ?, ?, ?, ?)`,
+		messageID, chatJID, sender, emoji, timestamp,
+	)
+	return err
+}
+
+// RepairChatTimes sets chats.last_message_time to the time of the newest STORED message of
+// each chat. Rule: whatever last_message_time points at must be retrievable through the
+// API. Earlier versions moved it for reactions and for message types that are not stored
+// (a phantom time that get_chat could not resolve), and history sync took it from the first
+// message of a conversation rather than the newest stored one. A chat without any stored
+// message gets NULL. Returns the number of changed chats.
+func (store *MessageStore) RepairChatTimes() (int64, error) {
+	res, err := store.db.Exec(`
+		UPDATE chats
+		SET last_message_time = (SELECT MAX(m.timestamp) FROM messages m WHERE m.chat_jid = chats.jid)
+		WHERE last_message_time IS NOT (SELECT MAX(m.timestamp) FROM messages m WHERE m.chat_jid = chats.jid)
+	`)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// NewestMessage returns id, is_from_me and time of the newest stored message of a chat
+// (used to anchor on-demand history sync requests).
+func (store *MessageStore) NewestMessage(chatJID string) (id string, isFromMe bool, timestamp time.Time, err error) {
+	err = store.db.QueryRow(
+		"SELECT id, is_from_me, timestamp FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT 1",
+		chatJID,
+	).Scan(&id, &isFromMe, &timestamp)
+	return
 }
 
 // Get messages from a chat
@@ -412,17 +500,14 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
-	// Save message to database
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
 
-	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
-	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
-
-	// Update chat in database with the message timestamp (keeps last message time updated)
-	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
-	if err != nil {
-		logger.Warnf("Failed to store chat: %v", err)
+	// A reaction (plain or, in groups, encrypted) belongs to its target message. It is not
+	// a message: it is not stored in messages and does not move last_message_time.
+	if reaction := reactionFromEvent(client, msg, logger); reaction != nil {
+		handleReaction(messageStore, chatJID, sender, reaction, msg.Info.Timestamp, logger)
+		return
 	}
 
 	// Extract text content
@@ -431,9 +516,19 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Extract media info
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
 
-	// Skip if there's no content and no media
+	// A message type we do not store (sticker, poll, protocol message...) must not move
+	// last_message_time - it would point at an event the API cannot return.
 	if content == "" && mediaType == "" {
 		return
+	}
+
+	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
+	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
+
+	// Update chat in database with the message timestamp (keeps last message time updated)
+	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
+	if err != nil {
+		logger.Warnf("Failed to store chat: %v", err)
 	}
 
 	// Store message in database
@@ -470,6 +565,107 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
 	}
+}
+
+// reactionFromEvent returns the reaction carried by an event, plain or encrypted (groups).
+func reactionFromEvent(client *whatsmeow.Client, msg *events.Message, logger waLog.Logger) *waProto.ReactionMessage {
+	if msg.Message == nil {
+		return nil
+	}
+	if r := msg.Message.GetReactionMessage(); r != nil {
+		return r
+	}
+	if msg.Message.GetEncReactionMessage() != nil {
+		r, err := client.DecryptReaction(context.Background(), msg)
+		if err != nil {
+			logger.Warnf("Failed to decrypt reaction: %v", err)
+			return nil
+		}
+		return r
+	}
+	return nil
+}
+
+// handleReaction stores (or, for an empty text, removes) the reaction to reaction.Key.ID.
+func handleReaction(messageStore *MessageStore, chatJID, sender string, reaction *waProto.ReactionMessage, eventTime time.Time, logger waLog.Logger) {
+	key := reaction.GetKey()
+	if key == nil || key.GetID() == "" {
+		return
+	}
+	timestamp := eventTime
+	if ms := reaction.GetSenderTimestampMS(); ms > 0 {
+		timestamp = time.UnixMilli(ms)
+	}
+	if err := messageStore.StoreReaction(key.GetID(), chatJID, sender, reaction.GetText(), timestamp); err != nil {
+		logger.Warnf("Failed to store reaction: %v", err)
+		return
+	}
+	if reaction.GetText() == "" {
+		fmt.Printf("[%s] %s removed reaction on %s\n", timestamp.Format("2006-01-02 15:04:05"), sender, key.GetID())
+	} else {
+		fmt.Printf("[%s] %s reacted %s on %s\n", timestamp.Format("2006-01-02 15:04:05"), sender, reaction.GetText(), key.GetID())
+	}
+}
+
+// storeHistoryReactions stores reactions found in a history sync, either attached to a
+// message (WebMessageInfo.reactions) or as a standalone reaction message. It returns true
+// when webMsg itself is a reaction (and must not be stored as a message).
+func storeHistoryReactions(client *whatsmeow.Client, messageStore *MessageStore, chatJID string, chat types.JID, webMsg *waProto.WebMessageInfo, logger waLog.Logger) bool {
+	if webMsg == nil {
+		return false
+	}
+	senderOf := func(key *waProto.MessageKey) string {
+		if key == nil {
+			return chat.User
+		}
+		if key.GetFromMe() {
+			if client != nil && client.Store != nil && client.Store.ID != nil {
+				return client.Store.ID.User
+			}
+			return ""
+		}
+		if p := key.GetParticipant(); p != "" {
+			if j, err := types.ParseJID(p); err == nil {
+				return j.User
+			}
+			return p
+		}
+		return chat.User
+	}
+	targetID := webMsg.GetKey().GetID()
+	for _, r := range webMsg.GetReactions() {
+		if targetID == "" {
+			break
+		}
+		ts := time.UnixMilli(r.GetSenderTimestampMS())
+		if r.GetSenderTimestampMS() <= 0 {
+			ts = time.Unix(int64(webMsg.GetMessageTimestamp()), 0)
+		}
+		if err := messageStore.StoreReaction(targetID, chatJID, senderOf(r.GetKey()), r.GetText(), ts); err != nil {
+			logger.Warnf("Failed to store history reaction: %v", err)
+		}
+	}
+	if r := webMsg.GetMessage().GetReactionMessage(); r != nil {
+		if r.GetKey().GetID() != "" {
+			ts := time.UnixMilli(r.GetSenderTimestampMS())
+			if r.GetSenderTimestampMS() <= 0 {
+				ts = time.Unix(int64(webMsg.GetMessageTimestamp()), 0)
+			}
+			if err := messageStore.StoreReaction(r.GetKey().GetID(), chatJID, senderOf(webMsg.GetKey()), r.GetText(), ts); err != nil {
+				logger.Warnf("Failed to store history reaction: %v", err)
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// HistoryRequest is the body of POST /api/history.
+type HistoryRequest struct {
+	ChatJID       string   `json:"chat_jid"`
+	Candidates    []string `json:"candidates"`
+	Count         int      `json:"count"`
+	IncludeNewest bool     `json:"include_newest"`
 }
 
 // DownloadMediaRequest represents the request body for the download media API
@@ -725,6 +921,87 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// On-demand history sync: asks the phone for the last N messages of a chat (including
+	// reactions attached to them). The answer arrives asynchronously as a HistorySync of
+	// type ON_DEMAND.
+	http.HandleFunc("/api/history", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req HistoryRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.Count <= 0 {
+			req.Count = 50
+		}
+		// The chat may be stored under any of the equivalent JID forms (LID / phone number).
+		// The phone answers the request only for the phone-number JID (a LID JID is ignored),
+		// while the anchor must be the newest message across ALL forms - otherwise messages
+		// stored under the other form stay beyond the anchor and never arrive.
+		candidates := append([]string{req.ChatJID}, req.Candidates...)
+		var chatJID, newestID string
+		var newestFromMe bool
+		var newestTime time.Time
+		// Candidates include synthetic forms (a LID number with the s.whatsapp.net server
+		// etc.); for the request prefer a phone-number JID we have a chat stored under, then
+		// the first phone-number JID, then the first candidate.
+		rank := func(c string) int {
+			r := 0
+			if strings.HasSuffix(c, "@s.whatsapp.net") {
+				r = 1
+				var n int
+				if messageStore.db.QueryRow("SELECT COUNT(*) FROM chats WHERE jid = ?", c).Scan(&n) == nil && n > 0 {
+					r = 2
+				}
+			}
+			return r
+		}
+		for _, c := range candidates {
+			if c == "" {
+				continue
+			}
+			if chatJID == "" || rank(c) > rank(chatJID) {
+				chatJID = c
+			}
+			id, fromMe, ts, err := messageStore.NewestMessage(c)
+			if err == nil && ts.After(newestTime) {
+				newestID, newestFromMe, newestTime = id, fromMe, ts
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if chatJID == "" || newestID == "" {
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: "No stored message to anchor the request on"})
+			return
+		}
+		jid, err := types.ParseJID(chatJID)
+		if err != nil {
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Invalid chat JID: %v", err)})
+			return
+		}
+		anchor := &types.MessageInfo{
+			MessageSource: types.MessageSource{Chat: jid, IsFromMe: newestFromMe},
+			ID:            newestID,
+			Timestamp:     newestTime,
+		}
+		if req.IncludeNewest {
+			// The phone returns messages BEFORE the anchor; to get the newest stored one too
+			// (with its reactions), anchor on a non-existent message one second later.
+			anchor.ID = client.GenerateMessageID()
+			anchor.IsFromMe = true
+			anchor.Timestamp = newestTime.Add(time.Second)
+		}
+		_, err = client.SendPeerMessage(context.Background(), client.BuildHistorySyncRequest(anchor, req.Count))
+		if err != nil {
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Failed to request history sync: %v", err)})
+			return
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: fmt.Sprintf(
+			"History sync of %d messages requested for %s (anchor %s); data arrives asynchronously", req.Count, chatJID, anchor.Timestamp.Format(time.RFC3339))})
+	})
+
 	// Handler for downloading media
 	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -875,6 +1152,12 @@ func main() {
 	if err != nil {
 		logger.Errorf("Failed to initialize message store: %v", err)
 		return
+	}
+	// Earlier versions moved last_message_time for reactions and unstored messages as well.
+	if n, err := messageStore.RepairChatTimes(); err != nil {
+		logger.Warnf("Failed to repair chat times: %v", err)
+	} else if n > 0 {
+		logger.Infof("Repaired last_message_time on %d chats", n)
 	}
 	defer messageStore.Close()
 
@@ -1107,6 +1390,11 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					}
 				}
 
+				// Reactions from history (attached or standalone); a standalone reaction is not a message.
+				if storeHistoryReactions(client, messageStore, chatJID, jid, msg.Message, logger) {
+					continue
+				}
+
 				// Extract media info
 				var mediaType, filename, url string
 				var mediaKey, fileSHA256, fileEncSHA256 []byte
@@ -1189,6 +1477,13 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 	}
 
 	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
+	// History sync set last_message_time from the first message of each conversation even
+	// when that message was not stored - realign to the newest stored one.
+	if n, err := messageStore.RepairChatTimes(); err != nil {
+		logger.Warnf("Failed to repair chat times: %v", err)
+	} else if n > 0 {
+		logger.Infof("Repaired last_message_time on %d chats", n)
+	}
 }
 
 // Request history sync from the server
