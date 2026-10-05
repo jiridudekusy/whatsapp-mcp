@@ -1112,9 +1112,15 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		var newestTime time.Time
 		// Candidates include synthetic forms (a LID number with the s.whatsapp.net server
 		// etc.); for the request prefer a phone-number JID we have a chat stored under, then
-		// the first phone-number JID, then the first candidate.
+		// the first phone-number JID, then the first candidate. The one exception is the chat
+		// with ourselves: the phone keeps it under our own LID and ignores requests for our
+		// phone number.
+		ownLID := client.Store.GetLID().ToNonAD().String()
 		rank := func(c string) int {
 			r := 0
+			if c == ownLID && c != "@lid" {
+				return 3
+			}
 			if strings.HasSuffix(c, "@s.whatsapp.net") {
 				r = 1
 				var n int
