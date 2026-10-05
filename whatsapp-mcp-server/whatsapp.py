@@ -390,15 +390,18 @@ def list_chats(
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        # Build base query
-        query_parts = ["""
+        # Build base query. Without the join the last-message columns are NULL; selecting
+        # messages.* without joining raised "no such column" and the tool returned nothing.
+        if include_last_message:
+            last_columns = "messages.content, messages.sender, messages.is_from_me"
+        else:
+            last_columns = "NULL, NULL, NULL"
+        query_parts = [f"""
             SELECT 
                 chats.jid,
                 chats.name,
                 chats.last_message_time,
-                messages.content as last_message,
-                messages.sender as last_sender,
-                messages.is_from_me as last_is_from_me
+                {last_columns}
             FROM chats
         """]
         
@@ -495,8 +498,11 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
         cursor = conn.cursor()
         params: list = []
         
+        # One row per chat: chats the contact wrote in, or the direct chat with them. The
+        # last message comes from a join on last_message_time, not from joining every
+        # message (which returned a row per message).
         cursor.execute("""
-            SELECT DISTINCT
+            SELECT
                 c.jid,
                 c.name,
                 c.last_message_time,
@@ -504,12 +510,14 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
                 m.sender as last_sender,
                 m.is_from_me as last_is_from_me
             FROM chats c
-            JOIN messages m ON c.jid = m.chat_jid
-            WHERE {where}
+            LEFT JOIN messages m ON m.chat_jid = c.jid AND m.timestamp = c.last_message_time
+            WHERE c.jid IN (SELECT chat_jid FROM messages WHERE {sender_in})
+               OR {chat_in}
+            GROUP BY c.jid
             ORDER BY c.last_message_time DESC
             LIMIT ? OFFSET ?
-        """.replace("{where}", _in_clause("m.sender", jids.user_variants(jid), params)
-                        + " OR " + _in_clause("c.jid", jids.candidate_jids(jid), params)),
+        """.replace("{sender_in}", _in_clause("sender", jids.user_variants(jid), params))
+           .replace("{chat_in}", _in_clause("c.jid", jids.candidate_jids(jid), params)),
             (*params, limit, page * limit))
         
         chats = cursor.fetchall()
