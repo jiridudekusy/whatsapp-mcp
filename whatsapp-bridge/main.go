@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -204,6 +205,144 @@ func (store *MessageStore) RepairChatTimes() (int64, error) {
 	return res.RowsAffected()
 }
 
+// ChatExists reports whether a chats row exists for the JID.
+func (store *MessageStore) ChatExists(jid string) bool {
+	var n int
+	return store.db.QueryRow("SELECT COUNT(*) FROM chats WHERE jid = ?", jid).Scan(&n) == nil && n > 0
+}
+
+var bareNumber = regexp.MustCompile(`^[0-9]+$`)
+
+// MergeSplitChats merges chats that exist under both JID forms of the same person into the
+// LID form. pairs holds {lidJID, pnJID}. Messages and reactions move over (a message already
+// present under the LID form is dropped from the phone-number form rather than duplicated),
+// a real name is preferred over a bare number, and the phone-number chat row is removed.
+// Returns the number of merged pairs.
+func (store *MessageStore) MergeSplitChats(pairs [][2]string) (int, error) {
+	merged := 0
+	for _, p := range pairs {
+		lid, pn := p[0], p[1]
+		if lid == "" || pn == "" || !store.ChatExists(lid) || !store.ChatExists(pn) {
+			continue
+		}
+		var lidName, pnName sql.NullString
+		store.db.QueryRow("SELECT name FROM chats WHERE jid = ?", lid).Scan(&lidName)
+		store.db.QueryRow("SELECT name FROM chats WHERE jid = ?", pn).Scan(&pnName)
+		name := lidName.String
+		if (name == "" || bareNumber.MatchString(name)) && pnName.String != "" && !bareNumber.MatchString(pnName.String) {
+			name = pnName.String
+		}
+		tx, err := store.db.Begin()
+		if err != nil {
+			return merged, err
+		}
+		steps := []struct {
+			q    string
+			args []interface{}
+		}{
+			{"UPDATE messages SET chat_jid = ? WHERE chat_jid = ? AND id NOT IN (SELECT id FROM messages WHERE chat_jid = ?)", []interface{}{lid, pn, lid}},
+			{"DELETE FROM messages WHERE chat_jid = ?", []interface{}{pn}},
+			{"UPDATE OR REPLACE reactions SET chat_jid = ? WHERE chat_jid = ?", []interface{}{lid, pn}},
+			{"UPDATE chats SET name = ? WHERE jid = ?", []interface{}{name, lid}},
+			{"DELETE FROM chats WHERE jid = ?", []interface{}{pn}},
+		}
+		for _, st := range steps {
+			if _, err := tx.Exec(st.q, st.args...); err != nil {
+				tx.Rollback()
+				return merged, fmt.Errorf("merging %s into %s: %v", pn, lid, err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return merged, err
+		}
+		merged++
+	}
+	if merged > 0 {
+		if _, err := store.RepairChatTimes(); err != nil {
+			return merged, err
+		}
+	}
+	return merged, nil
+}
+
+// loadLIDPairs reads whatsmeow's LID map from store/whatsapp.db as {lidJID, pnJID} pairs.
+func loadLIDPairs() ([][2]string, error) {
+	db, err := sql.Open("sqlite3", "file:store/whatsapp.db?mode=ro")
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	rows, err := db.Query("SELECT lid, pn FROM whatsmeow_lid_map")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var pairs [][2]string
+	for rows.Next() {
+		var lid, pn string
+		if err := rows.Scan(&lid, &pn); err == nil && lid != "" && pn != "" {
+			pairs = append(pairs, [2]string{lid + "@" + types.HiddenUserServer, pn + "@" + types.DefaultUserServer})
+		}
+	}
+	return pairs, rows.Err()
+}
+
+// mergeSplitChats runs MergeSplitChats with the current LID map and logs the outcome.
+func mergeSplitChats(messageStore *MessageStore, logger waLog.Logger) {
+	pairs, err := loadLIDPairs()
+	if err != nil {
+		logger.Warnf("Failed to load LID map: %v", err)
+		return
+	}
+	if n, err := messageStore.MergeSplitChats(pairs); err != nil {
+		logger.Warnf("Failed to merge split chats: %v", err)
+	} else if n > 0 {
+		logger.Infof("Merged %d chats split between LID and phone-number JIDs", n)
+	}
+}
+
+// jidLookup resolves the other form of a user JID: the phone number for a LID and the LID
+// for a phone number. Empty results mean "unknown".
+type jidLookup func(jid types.JID) (lid, pn types.JID)
+
+func whatsmeowLookup(client *whatsmeow.Client) jidLookup {
+	return func(jid types.JID) (lid, pn types.JID) {
+		ctx := context.Background()
+		switch jid.Server {
+		case types.HiddenUserServer:
+			lid = jid
+			if p, err := client.Store.LIDs.GetPNForLID(ctx, jid); err == nil {
+				pn = p
+			}
+		case types.DefaultUserServer:
+			pn = jid
+			if l, err := client.Store.LIDs.GetLIDForPN(ctx, jid); err == nil {
+				lid = l
+			}
+		}
+		return
+	}
+}
+
+// canonicalChatJID returns the JID a chat should be stored under. WhatsApp uses two forms
+// for the same person (LID and phone number): live messages arrive under one, history sync
+// and sent messages under the other, which split one conversation into two chats. Prefer
+// the form a chat row already exists for, and the LID form when both exist; groups and
+// JIDs without a known mapping are returned unchanged.
+func canonicalChatJID(store *MessageStore, jid types.JID, lookup jidLookup) string {
+	if jid.Server != types.DefaultUserServer && jid.Server != types.HiddenUserServer {
+		return jid.String()
+	}
+	lid, pn := lookup(jid)
+	if !lid.IsEmpty() && store.ChatExists(lid.ToNonAD().String()) {
+		return lid.ToNonAD().String()
+	}
+	if !pn.IsEmpty() && store.ChatExists(pn.ToNonAD().String()) {
+		return pn.ToNonAD().String()
+	}
+	return jid.String()
+}
+
 // NewestMessage returns id, is_from_me and time of the newest stored message of a chat
 // (used to anchor on-demand history sync requests).
 func (store *MessageStore) NewestMessage(chatJID string) (id string, isFromMe bool, timestamp time.Time, err error) {
@@ -293,10 +432,15 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
+	// Upload details of the sent media, kept so the sent message can be stored like a
+	// received one (and its media downloaded later).
+	var sentMediaType, sentFileName, sentURL string
+	var sentMediaKey, sentFileSHA256, sentFileEncSHA256 []byte
+	var sentFileLength uint64
 
 	// Create JID for recipient
 	var recipientJID types.JID
@@ -377,6 +521,13 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		if err != nil {
 			return false, fmt.Sprintf("Error uploading media: %v", err)
 		}
+		sentMediaType = map[whatsmeow.MediaType]string{
+			whatsmeow.MediaImage: "image", whatsmeow.MediaVideo: "video",
+			whatsmeow.MediaAudio: "audio", whatsmeow.MediaDocument: "document",
+		}[mediaType]
+		sentFileName = filepath.Base(mediaPath)
+		sentURL, sentMediaKey, sentFileSHA256, sentFileEncSHA256, sentFileLength =
+			resp.URL, resp.MediaKey, resp.FileSHA256, resp.FileEncSHA256, resp.FileLength
 
 		fmt.Println("Media uploaded", resp)
 
@@ -452,10 +603,24 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
-
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
+	}
+
+	// whatsmeow does not echo messages sent by this device as events, so without storing
+	// them here the local mirror lacked everything sent through the API - and a chat with
+	// only our own messages had nothing to anchor a history sync on.
+	if messageStore != nil {
+		chatJID := canonicalChatJID(messageStore, recipientJID, whatsmeowLookup(client))
+		name := GetChatName(client, messageStore, recipientJID, chatJID, nil, "", waLog.Noop)
+		if err := messageStore.StoreChat(chatJID, name, resp.Timestamp); err != nil {
+			fmt.Printf("Failed to store chat for sent message: %v\n", err)
+		}
+		if err := messageStore.StoreMessage(resp.ID, chatJID, client.Store.ID.User, message, resp.Timestamp, true,
+			sentMediaType, sentFileName, sentURL, sentMediaKey, sentFileSHA256, sentFileEncSHA256, sentFileLength); err != nil {
+			fmt.Printf("Failed to store sent message: %v\n", err)
+		}
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
@@ -500,7 +665,7 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
-	chatJID := msg.Info.Chat.String()
+	chatJID := canonicalChatJID(messageStore, msg.Info.Chat, whatsmeowLookup(client))
 	sender := msg.Info.Sender.User
 
 	// A reaction (plain or, in groups, encrypted) belongs to its target message. It is not
@@ -904,7 +1069,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -972,9 +1137,15 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
-		if chatJID == "" || newestID == "" {
-			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: "No stored message to anchor the request on"})
+		if chatJID == "" {
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: "No chat JID to request history for"})
 			return
+		}
+		if newestID == "" {
+			// Nothing stored for this chat yet (e.g. only our own messages before they were
+			// mirrored): anchor on "now" so the phone returns the most recent messages.
+			newestTime = time.Now()
+			req.IncludeNewest = true
 		}
 		jid, err := types.ParseJID(chatJID)
 		if err != nil {
@@ -1159,6 +1330,8 @@ func main() {
 	} else if n > 0 {
 		logger.Infof("Repaired last_message_time on %d chats", n)
 	}
+	// One conversation may also have been stored under both JID forms of a person.
+	mergeSplitChats(messageStore, logger)
 	defer messageStore.Close()
 
 	// Setup event handling for messages and history sync
@@ -1351,6 +1524,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			logger.Warnf("Failed to parse JID %s: %v", chatJID, err)
 			continue
 		}
+		chatJID = canonicalChatJID(messageStore, jid, whatsmeowLookup(client))
 
 		// Get appropriate chat name by passing the history sync conversation directly
 		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
@@ -1484,6 +1658,8 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 	} else if n > 0 {
 		logger.Infof("Repaired last_message_time on %d chats", n)
 	}
+	// One conversation may also have been stored under both JID forms of a person.
+	mergeSplitChats(messageStore, logger)
 }
 
 // Request history sync from the server

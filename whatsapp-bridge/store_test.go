@@ -8,6 +8,8 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"go.mau.fi/whatsmeow/types"
 )
 
 func newTestStore(t *testing.T) *MessageStore {
@@ -220,5 +222,88 @@ func TestStoreMessageDoesNotDuplicateAcrossJidVariants(t *testing.T) {
 	store.db.QueryRow("SELECT content FROM messages WHERE id = 'M1'").Scan(&content)
 	if content != "Hello (edited)" {
 		t.Fatalf("upsert under the same chat did not happen: %q", content)
+	}
+}
+
+func TestCanonicalChatJIDPrefersExistingAndLID(t *testing.T) {
+	store := newTestStore(t)
+	lid := types.NewJID("159472202842303", types.HiddenUserServer)
+	pn := types.NewJID("420775931113", types.DefaultUserServer)
+	lookup := func(j types.JID) (types.JID, types.JID) { return lid, pn }
+
+	// no chat row yet: keep the form the event arrived with
+	if got := canonicalChatJID(store, pn, lookup); got != pn.String() {
+		t.Fatalf("no rows: %s", got)
+	}
+	// only the phone-number chat exists: a LID event joins it
+	store.StoreChat(pn.String(), "Reception", msgTime)
+	if got := canonicalChatJID(store, lid, lookup); got != pn.String() {
+		t.Fatalf("pn row only: %s", got)
+	}
+	// both exist: the LID form wins
+	store.StoreChat(lid.String(), "", msgTime)
+	if got := canonicalChatJID(store, pn, lookup); got != lid.String() {
+		t.Fatalf("both rows: %s", got)
+	}
+	// groups and unknown mappings pass through
+	group := types.NewJID("420724484432-1632738465", types.GroupServer)
+	if got := canonicalChatJID(store, group, lookup); got != group.String() {
+		t.Fatalf("group: %s", got)
+	}
+	unknown := types.NewJID("420111222333", types.DefaultUserServer)
+	none := func(j types.JID) (types.JID, types.JID) { return types.EmptyJID, j }
+	if got := canonicalChatJID(store, unknown, none); got != unknown.String() {
+		t.Fatalf("unknown: %s", got)
+	}
+}
+
+func TestMergeSplitChatsMovesMessagesAndKeepsRealName(t *testing.T) {
+	store := newTestStore(t)
+	pn := "420775931113@s.whatsapp.net"
+	// LID chat named after a bare number with the newest message; phone chat with history,
+	// one message present in both, and a reaction under the phone form.
+	store.StoreChat(lidChat, "212777058713738", msgTime)
+	store.StoreMessage("N1", lidChat, "212777058713738", "newest", msgTime, true, "", "", "", nil, nil, nil, 0)
+	store.StoreMessage("B1", lidChat, "420775931113", "both", msgTime.Add(-time.Hour), false, "", "", "", nil, nil, nil, 0)
+	store.StoreChat(pn, "Reception", msgTime.Add(-time.Hour))
+	mustExec(t, store, "INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me) VALUES (?,?,?,?,?,?)",
+		"B1", pn, "420775931113", "both", msgTime.Add(-time.Hour), false)
+	store.StoreMessage("O1", pn, "420775931113", "old", msgTime.Add(-2*time.Hour), false, "", "", "", nil, nil, nil, 0)
+	mustExec(t, store, "INSERT INTO reactions VALUES (?,?,?,?,?)", "O1", pn, "420724484432", "👍", msgTime)
+
+	n, err := store.MergeSplitChats([][2]string{{lidChat, pn}, {"1@lid", "2@s.whatsapp.net"}})
+	if err != nil || n != 1 {
+		t.Fatalf("merged=%d err=%v", n, err)
+	}
+	if store.ChatExists(pn) {
+		t.Fatal("phone-number chat row still exists")
+	}
+	var cnt int
+	store.db.QueryRow("SELECT COUNT(*) FROM messages WHERE chat_jid = ?", lidChat).Scan(&cnt)
+	if cnt != 3 {
+		t.Fatalf("want 3 messages under the LID chat, got %d", cnt)
+	}
+	store.db.QueryRow("SELECT COUNT(*) FROM messages WHERE id = 'B1'").Scan(&cnt)
+	if cnt != 1 {
+		t.Fatalf("duplicate message B1 kept: %d", cnt)
+	}
+	var name string
+	store.db.QueryRow("SELECT name FROM chats WHERE jid = ?", lidChat).Scan(&name)
+	if name != "Reception" {
+		t.Fatalf("real name not kept: %q", name)
+	}
+	var rchat string
+	store.db.QueryRow("SELECT chat_jid FROM reactions WHERE message_id = 'O1'").Scan(&rchat)
+	if rchat != lidChat {
+		t.Fatalf("reaction not moved: %s", rchat)
+	}
+	var last time.Time
+	store.db.QueryRow("SELECT last_message_time FROM chats WHERE jid = ?", lidChat).Scan(&last)
+	if !last.Equal(msgTime) {
+		t.Fatalf("last_message_time after merge: %v", last)
+	}
+	// idempotent
+	if n, _ := store.MergeSplitChats([][2]string{{lidChat, pn}}); n != 0 {
+		t.Fatalf("second merge did %d", n)
 	}
 }
