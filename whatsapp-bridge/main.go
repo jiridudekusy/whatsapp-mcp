@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -24,6 +25,7 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -775,7 +777,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	serverAddr := restBindAddr(port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
@@ -784,6 +786,45 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
+}
+
+// restBindAddr returns the listen address of the REST API. The API has no authentication,
+// so WHATSAPP_REST_BIND (e.g. "127.0.0.1:8080") lets deployments keep it off the network;
+// the default keeps the historical behaviour of listening on all interfaces.
+func restBindAddr(port int) string {
+	if v := os.Getenv("WHATSAPP_REST_BIND"); v != "" {
+		return v
+	}
+	return fmt.Sprintf(":%d", port)
+}
+
+func envInt(name string) int {
+	v, err := strconv.Atoi(os.Getenv(name))
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+// configureDeviceProps applies optional pairing-time settings from the environment.
+// WhatsApp reads these only when a new device is paired; changing them for an existing
+// session has no effect until the device is unlinked and paired again.
+//
+//	WHATSAPP_DEVICE_NAME          name shown in the phone's "Linked devices" list
+//	WHATSAPP_FULL_HISTORY_DAYS    request full history (up to N days) instead of the
+//	                              default "recent" sync of roughly the last three months
+//	WHATSAPP_FULL_HISTORY_SIZE_MB size cap for that full history sync
+func configureDeviceProps() {
+	if name := os.Getenv("WHATSAPP_DEVICE_NAME"); name != "" {
+		store.DeviceProps.Os = proto.String(name)
+	}
+	if days := envInt("WHATSAPP_FULL_HISTORY_DAYS"); days > 0 {
+		store.DeviceProps.RequireFullSync = proto.Bool(true)
+		store.DeviceProps.HistorySyncConfig.FullSyncDaysLimit = proto.Uint32(uint32(days))
+		if mb := envInt("WHATSAPP_FULL_HISTORY_SIZE_MB"); mb > 0 {
+			store.DeviceProps.HistorySyncConfig.FullSyncSizeMbLimit = proto.Uint32(uint32(mb))
+		}
+	}
 }
 
 func main() {
@@ -820,6 +861,9 @@ func main() {
 	}
 
 	// Create client instance
+	// Pairing-time settings (device name, history depth) from the environment.
+	configureDeviceProps()
+
 	client := whatsmeow.NewClient(deviceStore, logger)
 	if client == nil {
 		logger.Errorf("Failed to create WhatsApp client")
