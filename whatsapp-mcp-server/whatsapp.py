@@ -11,6 +11,44 @@ import jids
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
 
+# When the server runs in a container, clients refer to files by host paths. WHATSAPP_PATH_MAP
+# ("host_prefix=local_prefix;host_prefix=local_prefix") maps them both ways: media to send is
+# translated to the local path, paths returned by download_media back to the client's view.
+# Each mapping normally corresponds to a bind mount.
+def _path_map() -> List[Tuple[str, str]]:
+    pairs = []
+    for item in os.environ.get("WHATSAPP_PATH_MAP", "").split(";"):
+        if "=" in item:
+            host, local = item.split("=", 1)
+            if host.strip() and local.strip():
+                pairs.append((host.strip().rstrip("/"), local.strip().rstrip("/")))
+    return pairs
+
+
+def _translate(path: str, pairs: List[Tuple[str, str]]) -> str:
+    for src, dst in pairs:
+        if path == src or path.startswith(src + "/"):
+            return dst + path[len(src):]
+    return path
+
+
+def to_local_path(path: str) -> str:
+    """Path as the server sees it (client/host path -> local path)."""
+    return _translate(path, _path_map())
+
+
+def to_client_path(path: str) -> str:
+    """Path as the client sees it (local path -> client/host path)."""
+    return _translate(path, [(local, host) for host, local in _path_map()])
+
+
+def media_not_found(path: str) -> str:
+    message = f"Media file not found: {path}"
+    hosts = [host for host, _ in _path_map()]
+    if hosts:
+        message += ". The server can read files under: " + ", ".join(hosts)
+    return message
+
 @dataclass
 class Message:
     timestamp: datetime
@@ -749,8 +787,9 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
         if not media_path:
             return False, "Media path must be provided"
         
+        media_path = to_local_path(media_path)
         if not os.path.isfile(media_path):
-            return False, f"Media file not found: {media_path}"
+            return False, media_not_found(media_path)
         
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
@@ -783,8 +822,9 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
         if not media_path:
             return False, "Media path must be provided"
         
+        media_path = to_local_path(media_path)
         if not os.path.isfile(media_path):
-            return False, f"Media file not found: {media_path}"
+            return False, media_not_found(media_path)
 
         if not media_path.endswith(".ogg"):
             try:
@@ -836,7 +876,7 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
         if response.status_code == 200:
             result = response.json()
             if result.get("success", False):
-                path = result.get("path")
+                path = to_client_path(result.get("path") or "")
                 print(f"Media downloaded successfully: {path}")
                 return path
             else:
