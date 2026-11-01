@@ -1029,13 +1029,9 @@ func extractDirectPathFromURL(url string) string {
 		return url // Return original URL if parsing fails
 	}
 
-	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
-	return "/" + pathPart
+	// Keep the query: the CDN rejects the path without its signature (oh, oe)
+	// with 403, and whatsmeow appends its own parameters with "&".
+	return "/" + parts[1]
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
